@@ -15,14 +15,21 @@
 package storage_test
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/johannesboyne/gofakes3"
+	"github.com/johannesboyne/gofakes3/backend/s3mem"
 	_ "github.com/joho/godotenv/autoload"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 
 	"github.com/livekit/storage"
 )
@@ -158,6 +165,223 @@ func TestS3(t *testing.T) {
 	require.NoError(t, err)
 
 	testStorage(t, s)
+}
+
+func TestCustomHeadersYAML(t *testing.T) {
+	want := storage.CustomHeaders{
+		"x-amz-server-side-encryption": "AES256",
+		"x-custom":                     "value",
+	}
+
+	cases := []struct {
+		name string
+		in   string
+		want storage.CustomHeaders
+	}{
+		{
+			name: "native map",
+			in: `
+custom_headers:
+  x-amz-server-side-encryption: AES256
+  x-custom: value
+`,
+			want: want,
+		},
+		{
+			name: "quoted JSON string (env-var style)",
+			in:   `custom_headers: '{"x-amz-server-side-encryption":"AES256","x-custom":"value"}'`,
+			want: want,
+		},
+		{
+			name: "inline JSON (YAML flow syntax, no quotes)",
+			in:   `custom_headers: {"x-amz-server-side-encryption":"AES256","x-custom":"value"}`,
+			want: want,
+		},
+		{
+			name: "empty string",
+			in:   `custom_headers: ""`,
+			want: nil,
+		},
+		{
+			name: "omitted",
+			in:   `bucket: foo`,
+			want: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var cfg storage.S3Config
+			require.NoError(t, yaml.Unmarshal([]byte(tc.in), &cfg))
+			require.Equal(t, tc.want, cfg.CustomHeaders)
+		})
+	}
+}
+
+func TestCustomHeadersJSON(t *testing.T) {
+	want := storage.CustomHeaders{
+		"x-amz-server-side-encryption": "AES256",
+		"x-custom":                     "value",
+	}
+
+	cases := []struct {
+		name string
+		in   string
+		want storage.CustomHeaders
+	}{
+		{
+			name: "native object",
+			in:   `{"custom_headers":{"x-amz-server-side-encryption":"AES256","x-custom":"value"}}`,
+			want: want,
+		},
+		{
+			name: "JSON-encoded string (env-var style)",
+			in:   `{"custom_headers":"{\"x-amz-server-side-encryption\":\"AES256\",\"x-custom\":\"value\"}"}`,
+			want: want,
+		},
+		{
+			name: "empty string",
+			in:   `{"custom_headers":""}`,
+			want: nil,
+		},
+		{
+			name: "omitted",
+			in:   `{"bucket":"foo"}`,
+			want: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var cfg storage.S3Config
+			require.NoError(t, json.Unmarshal([]byte(tc.in), &cfg))
+			require.Equal(t, tc.want, cfg.CustomHeaders)
+		})
+	}
+}
+
+func TestCustomHeadersInvalid(t *testing.T) {
+	t.Run("yaml: malformed JSON string", func(t *testing.T) {
+		var cfg storage.S3Config
+		err := yaml.Unmarshal([]byte(`custom_headers: '{not json}'`), &cfg)
+		require.Error(t, err)
+	})
+
+	t.Run("json: malformed JSON string", func(t *testing.T) {
+		var cfg storage.S3Config
+		err := json.Unmarshal([]byte(`{"custom_headers":"{not json}"}`), &cfg)
+		require.Error(t, err)
+	})
+}
+
+func TestCustomHeadersReserved(t *testing.T) {
+	reserved := []string{
+		"Authorization",
+		"authorization",
+		"X-Amz-Date",
+		"x-amz-content-sha256",
+		"X-Amz-Security-Token",
+		"Host",
+		"Content-Length",
+		"Content-MD5",
+	}
+	for _, name := range reserved {
+		t.Run("yaml:"+name, func(t *testing.T) {
+			var cfg storage.S3Config
+			in := fmt.Sprintf("custom_headers:\n  %s: value\n", name)
+			err := yaml.Unmarshal([]byte(in), &cfg)
+			require.ErrorContains(t, err, "reserved")
+		})
+		t.Run("json:"+name, func(t *testing.T) {
+			var cfg storage.S3Config
+			in := fmt.Sprintf(`{"custom_headers":{%q:"value"}}`, name)
+			err := json.Unmarshal([]byte(in), &cfg)
+			require.ErrorContains(t, err, "reserved")
+		})
+		t.Run("NewS3:"+name, func(t *testing.T) {
+			_, err := storage.NewS3(&storage.S3Config{
+				AccessKey:     "test",
+				Secret:        "test",
+				Region:        "us-east-1",
+				Bucket:        "b",
+				CustomHeaders: storage.CustomHeaders{name: "value"},
+			})
+			require.ErrorContains(t, err, "reserved")
+		})
+	}
+}
+
+func TestCustomHeadersMalformed(t *testing.T) {
+	cases := []struct {
+		name    string
+		headers storage.CustomHeaders
+		msg     string
+	}{
+		{"empty name", storage.CustomHeaders{"": "v"}, "invalid header name"},
+		{"space in name", storage.CustomHeaders{"bad name": "v"}, "invalid header name"},
+		{"newline in name", storage.CustomHeaders{"bad\nname": "v"}, "invalid header name"},
+		{"CR in value", storage.CustomHeaders{"X-Ok": "a\rb"}, "invalid value"},
+		{"LF in value", storage.CustomHeaders{"X-Ok": "a\nb"}, "invalid value"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := storage.NewS3(&storage.S3Config{
+				AccessKey:     "test",
+				Secret:        "test",
+				Region:        "us-east-1",
+				Bucket:        "b",
+				CustomHeaders: tc.headers,
+			})
+			require.ErrorContains(t, err, tc.msg)
+		})
+	}
+}
+
+func TestS3CustomHeaders(t *testing.T) {
+	const bucket = "test-bucket"
+
+	backend := s3mem.New()
+	require.NoError(t, backend.CreateBucket(bucket))
+	faker := gofakes3.New(backend)
+
+	var (
+		mu       sync.Mutex
+		captured []http.Header
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		captured = append(captured, r.Header.Clone())
+		mu.Unlock()
+		faker.Server().ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+
+	customHeaders := storage.CustomHeaders{
+		"x-amz-server-side-encryption": "AES256",
+		"x-custom-test":                "hello",
+	}
+
+	s, err := storage.NewS3(&storage.S3Config{
+		AccessKey:      "test",
+		Secret:         "test",
+		Region:         "us-east-1",
+		Endpoint:       ts.URL,
+		Bucket:         bucket,
+		ForcePathStyle: true,
+		CustomHeaders:  customHeaders,
+	})
+	require.NoError(t, err)
+
+	testStorage(t, s)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.NotEmpty(t, captured, "no requests captured")
+	for i, h := range captured {
+		for k, v := range customHeaders {
+			require.Equal(t, v, h.Get(k), "request %d missing %q", i, k)
+		}
+	}
 }
 
 func testStorage(t *testing.T, s storage.Storage) {

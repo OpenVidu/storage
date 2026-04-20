@@ -48,6 +48,10 @@ type s3Storage struct {
 }
 
 func NewS3(conf *S3Config) (Storage, error) {
+	if err := validateCustomHeaders(conf.CustomHeaders); err != nil {
+		return nil, err
+	}
+
 	var cp aws.CredentialsProvider
 
 	if conf.AccessKey != "" && conf.Secret != "" {
@@ -180,6 +184,25 @@ func (s *s3Storage) getClient(l logging.Logger) *s3.Client {
 					return smithyhttp.AddContentChecksumMiddleware(stack)
 				})
 			}
+		}
+
+		if len(s.conf.CustomHeaders) > 0 {
+			headers := s.conf.CustomHeaders
+			o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+				return stack.Build.Add(middleware.BuildMiddlewareFunc(
+					"SetCustomHeaders",
+					func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (middleware.BuildOutput, middleware.Metadata, error) {
+						req, ok := in.Request.(*smithyhttp.Request)
+						if !ok {
+							return middleware.BuildOutput{}, middleware.Metadata{}, fmt.Errorf("unexpected transport type %T", in.Request)
+						}
+						for k, v := range headers {
+							req.Header.Set(k, v)
+						}
+						return next.HandleBuild(ctx, in)
+					},
+				), middleware.After)
+			})
 		}
 	})
 }
