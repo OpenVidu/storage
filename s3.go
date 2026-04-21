@@ -48,7 +48,17 @@ const (
 	SSETypeKMS = "SSE-KMS"
 )
 
+func (c *S3SSEConfig) isEmpty() bool {
+	return c == nil || (c.Type == "" && c.KMSKeyID == "" && c.KMSEncryptionContext == "")
+}
+
 func validateSSEConfig(sse *S3SSEConfig) error {
+	if sse.isEmpty() {
+		return nil
+	}
+	if sse.Type == "" {
+		return fmt.Errorf("s3 sse: type is required when kms_key_id or kms_encryption_context is set")
+	}
 	switch sse.Type {
 	case SSETypeS3:
 		if sse.KMSKeyID != "" {
@@ -93,10 +103,8 @@ type s3Storage struct {
 }
 
 func NewS3(conf *S3Config) (Storage, error) {
-	if conf.SSE != nil {
-		if err := validateSSEConfig(conf.SSE); err != nil {
-			return nil, err
-		}
+	if err := validateSSEConfig(conf.SSE); err != nil {
+		return nil, err
 	}
 
 	var cp aws.CredentialsProvider
@@ -285,7 +293,7 @@ func (s *s3Storage) upload(reader io.Reader, storagePath, contentType string) (s
 		contentDisposition := "inline"
 		input.ContentDisposition = &contentDisposition
 	}
-	if s.conf.SSE != nil {
+	if !s.conf.SSE.isEmpty() {
 		applySSE(input, s.conf.SSE)
 	}
 
