@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -42,12 +43,62 @@ import (
 
 const defaultBucketLocation = "us-east-1"
 
+const (
+	SSETypeS3  = "SSE-S3"
+	SSETypeKMS = "SSE-KMS"
+)
+
+func validateSSEConfig(sse *S3SSEConfig) error {
+	switch sse.Type {
+	case SSETypeS3:
+		if sse.KMSKeyID != "" {
+			return fmt.Errorf("s3 sse: kms_key_id must not be set when type is %s", SSETypeS3)
+		}
+		if sse.KMSEncryptionContext != "" {
+			return fmt.Errorf("s3 sse: kms_encryption_context must not be set when type is %s", SSETypeS3)
+		}
+	case SSETypeKMS:
+		if sse.KMSKeyID == "" {
+			return fmt.Errorf("s3 sse: kms_key_id is required when type is %s", SSETypeKMS)
+		}
+		if sse.KMSEncryptionContext != "" {
+			var probe map[string]any
+			if err := json.Unmarshal([]byte(sse.KMSEncryptionContext), &probe); err != nil {
+				return fmt.Errorf("s3 sse: kms_encryption_context must be valid JSON: %w", err)
+			}
+		}
+	default:
+		return fmt.Errorf("s3 sse: unsupported type %q (expected %q or %q)", sse.Type, SSETypeS3, SSETypeKMS)
+	}
+	return nil
+}
+
+func applySSE(input *s3.PutObjectInput, sse *S3SSEConfig) {
+	switch sse.Type {
+	case SSETypeS3:
+		input.ServerSideEncryption = types.ServerSideEncryptionAes256
+	case SSETypeKMS:
+		input.ServerSideEncryption = types.ServerSideEncryptionAwsKms
+		input.SSEKMSKeyId = aws.String(sse.KMSKeyID)
+		if sse.KMSEncryptionContext != "" {
+			encoded := base64.StdEncoding.EncodeToString([]byte(sse.KMSEncryptionContext))
+			input.SSEKMSEncryptionContext = aws.String(encoded)
+		}
+	}
+}
+
 type s3Storage struct {
 	conf    *S3Config
 	awsConf *aws.Config
 }
 
 func NewS3(conf *S3Config) (Storage, error) {
+	if conf.SSE != nil {
+		if err := validateSSEConfig(conf.SSE); err != nil {
+			return nil, err
+		}
+	}
+
 	var cp aws.CredentialsProvider
 
 	if conf.AccessKey != "" && conf.Secret != "" {
@@ -233,6 +284,9 @@ func (s *s3Storage) upload(reader io.Reader, storagePath, contentType string) (s
 	} else {
 		contentDisposition := "inline"
 		input.ContentDisposition = &contentDisposition
+	}
+	if s.conf.SSE != nil {
+		applySSE(input, s.conf.SSE)
 	}
 
 	if _, err := manager.NewUploader(client).Upload(context.Background(), input); err != nil {

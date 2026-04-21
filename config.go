@@ -63,6 +63,18 @@ type S3Config struct {
 	Metadata           map[string]string `yaml:"metadata,omitempty"`
 	Tagging            string            `yaml:"tagging,omitempty"`
 	ContentDisposition string            `yaml:"content_disposition,omitempty"`
+
+	SSE *S3SSEConfig `yaml:"sse,omitempty"`
+}
+
+// S3SSEConfig configures S3 server-side encryption.
+// Type must be either "SSE-S3" or "SSE-KMS". When Type is "SSE-KMS",
+// KMSKeyID is required. KMSEncryptionContext, if set, must be a valid
+// JSON object and is only used with "SSE-KMS".
+type S3SSEConfig struct {
+	Type                 string `yaml:"type,omitempty"`
+	KMSKeyID             string `yaml:"kms_key_id,omitempty"`
+	KMSEncryptionContext string `yaml:"kms_encryption_context,omitempty"`
 }
 
 type ProxyConfig struct {
