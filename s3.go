@@ -19,11 +19,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -38,8 +40,21 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go/logging"
 	"github.com/aws/smithy-go/middleware"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
+
+func wrapS3Error(err error) error {
+	if err == nil {
+		return nil
+	}
+	var sc interface{ HTTPStatusCode() int }
+	if errors.As(err, &sc) {
+		return &ErrorWithStatusCode{
+			Err:        err,
+			StatusCode: sc.HTTPStatusCode(),
+		}
+	}
+	return err
+}
 
 const defaultBucketLocation = "us-east-1"
 
@@ -209,7 +224,7 @@ func updateRegion(awsConf *aws.Config, bucket string) error {
 
 	resp, err := s3.NewFromConfig(*awsConf).GetBucketLocation(context.Background(), req)
 	if err != nil {
-		return err
+		return wrapS3Error(err)
 	}
 
 	if resp.LocationConstraint != "" {
@@ -228,17 +243,10 @@ func (s *s3Storage) getClient(l logging.Logger) *s3.Client {
 
 		o.UsePathStyle = s.conf.ForcePathStyle
 
-		// switch to md5 checksum for oracle cloud
 		if s.conf.Endpoint != "" {
-			if parsed, err := url.Parse(s.conf.Endpoint); err == nil && strings.HasSuffix(parsed.Host, "oraclecloud.com") {
-				o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
-					stack.Initialize.Remove("AWSChecksum:SetupInputContext")
-					stack.Build.Remove("AWSChecksum:RequestMetricsTracking")
-					stack.Finalize.Remove("AWSChecksum:ComputeInputPayloadChecksum")
-					stack.Finalize.Remove("addInputChecksumTrailer")
-					return smithyhttp.AddContentChecksumMiddleware(stack)
-				})
-			}
+			// needed for compatibility with non-AWS S3-compatible providers (Oracle, etc.)
+			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+			o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 		}
 	})
 }
@@ -297,27 +305,58 @@ func (s *s3Storage) upload(reader io.Reader, storagePath, contentType string) (s
 		applySSE(input, s.conf.SSE)
 	}
 
-	if _, err := manager.NewUploader(client).Upload(context.Background(), input); err != nil {
+	// Uploader forces a CRC32 ChecksumAlgorithm on multipart uploads,
+	// which makes UploadPart use a trailing checksum encoded as Content-Encoding:
+	// aws-chunked. Non-AWS S3-compatible providers (e.g. OCI) don't support
+	// this, so clear the algorithm before any checksum middleware sees it.
+	uploader := manager.NewUploader(client, func(u *manager.Uploader) {
+		if s.conf.Endpoint != "" {
+			u.ClientOptions = append(u.ClientOptions, func(o *s3.Options) {
+				o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+					return stack.Initialize.Add(middleware.InitializeMiddlewareFunc(
+						"ClearMultipartChecksum",
+						func(ctx context.Context, in middleware.InitializeInput, next middleware.InitializeHandler) (
+							middleware.InitializeOutput, middleware.Metadata, error,
+						) {
+							switch v := in.Parameters.(type) {
+							case *s3.CreateMultipartUploadInput:
+								v.ChecksumAlgorithm = ""
+							case *s3.UploadPartInput:
+								v.ChecksumAlgorithm = ""
+							}
+							return next.HandleInitialize(ctx, in)
+						},
+					), middleware.Before)
+				})
+			})
+		}
+	})
+
+	if _, err := uploader.Upload(context.Background(), input); err != nil {
 		l.WriteLogs()
-		return "", err
+		return "", wrapS3Error(err)
 	}
 
+	return s.location(storagePath), nil
+}
+
+func (s *s3Storage) location(storagePath string) string {
 	endpoint := "s3.amazonaws.com"
 	if s.conf.Endpoint != "" {
 		endpoint = s.conf.Endpoint
 	}
+	endpoint = strings.TrimPrefix(endpoint, "https://")
+	endpoint = strings.TrimPrefix(endpoint, "http://")
 
-	var location string
+	loc := url.URL{Scheme: "https"}
 	if s.conf.ForcePathStyle {
-		if !strings.HasPrefix(endpoint, "http") {
-			endpoint = "https://" + endpoint
-		}
-		location = fmt.Sprintf("%s/%s/%s", endpoint, s.conf.Bucket, storagePath)
+		loc.Host = endpoint
+		loc.Path = path.Join(s.conf.Bucket, storagePath)
 	} else {
-		location = fmt.Sprintf("https://%s.%s/%s", s.conf.Bucket, endpoint, storagePath)
+		loc.Host = s.conf.Bucket + "." + endpoint
+		loc.Path = storagePath
 	}
-
-	return location, nil
+	return loc.String()
 }
 
 func (s *s3Storage) ListObjects(prefix string) ([]string, error) {
@@ -332,7 +371,7 @@ func (s *s3Storage) ListObjects(prefix string) ([]string, error) {
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(context.Background())
 		if err != nil {
-			return nil, err
+			return nil, wrapS3Error(err)
 		}
 
 		for _, obj := range page.Contents {
@@ -366,7 +405,7 @@ func (s *s3Storage) DownloadFile(filepath, storagePath string) (int64, error) {
 func (s *s3Storage) download(w io.WriterAt, storagePath string) (int64, error) {
 	client := s.getClient(nil)
 
-	return manager.NewDownloader(client).Download(
+	n, err := manager.NewDownloader(client).Download(
 		context.Background(),
 		w,
 		&s3.GetObjectInput{
@@ -374,6 +413,7 @@ func (s *s3Storage) download(w io.WriterAt, storagePath string) (int64, error) {
 			Key:    aws.String(storagePath),
 		},
 	)
+	return n, wrapS3Error(err)
 }
 
 func (s *s3Storage) GeneratePresignedUrl(storagePath string, expiration time.Duration) (string, error) {
@@ -384,7 +424,7 @@ func (s *s3Storage) GeneratePresignedUrl(storagePath string, expiration time.Dur
 		Key:    aws.String(storagePath),
 	}, s3.WithPresignExpires(expiration))
 	if err != nil {
-		return "", err
+		return "", wrapS3Error(err)
 	}
 
 	return res.URL, nil
@@ -397,7 +437,7 @@ func (s *s3Storage) DeleteObject(storagePath string) error {
 		Bucket: aws.String(s.conf.Bucket),
 		Key:    aws.String(storagePath),
 	})
-	return err
+	return wrapS3Error(err)
 }
 
 func (s *s3Storage) DeleteObjects(storagePaths []string) error {
@@ -414,15 +454,21 @@ func (s *s3Storage) DeleteObjects(storagePaths []string) error {
 			objects = append(objects, types.ObjectIdentifier{Key: aws.String(path)})
 		}
 
-		_, err := client.DeleteObjects(context.Background(), &s3.DeleteObjectsInput{
+		deleteInput := &s3.DeleteObjectsInput{
 			Bucket: aws.String(s.conf.Bucket),
 			Delete: &types.Delete{
 				Objects: objects,
 				Quiet:   aws.Bool(true),
 			},
-		})
+		}
+		if s.conf.Endpoint != "" {
+			// SHA256 is supported by most S3-compatible backends
+			deleteInput.ChecksumAlgorithm = types.ChecksumAlgorithmSha256
+		}
+
+		_, err := client.DeleteObjects(context.Background(), deleteInput)
 		if err != nil {
-			return err
+			return wrapS3Error(err)
 		}
 	}
 

@@ -29,11 +29,32 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/googleapis/gax-go/v2"
 	"golang.org/x/oauth2/google"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 )
 
 const storageScope = "https://www.googleapis.com/auth/devstorage.read_write"
+
+func wrapGCPError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, storage.ErrBucketNotExist) || errors.Is(err, storage.ErrObjectNotExist) {
+		return &ErrorWithStatusCode{
+			Err:        err,
+			StatusCode: http.StatusNotFound,
+		}
+	}
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) {
+		return &ErrorWithStatusCode{
+			Err:        err,
+			StatusCode: apiErr.Code,
+		}
+	}
+	return err
+}
 
 type gcpStorage struct {
 	conf   *GCPConfig
@@ -96,7 +117,7 @@ func (s *gcpStorage) UploadFile(filepath, storagePath, contentType string) (stri
 	return s.upload(file, storagePath, contentType)
 }
 
-func (s *gcpStorage) upload(reader io.Reader, storagePath, _ string) (string, int64, error) {
+func (s *gcpStorage) upload(reader io.Reader, storagePath, contentType string) (string, int64, error) {
 	wc := s.client.Bucket(s.conf.Bucket).Object(storagePath).Retryer(
 		storage.WithBackoff(gax.Backoff{
 			Initial:    time.Millisecond * 100,
@@ -106,18 +127,27 @@ func (s *gcpStorage) upload(reader io.Reader, storagePath, _ string) (string, in
 		storage.WithMaxAttempts(5),
 		storage.WithPolicy(storage.RetryAlways),
 	).NewWriter(context.Background())
+	wc.ContentType = contentType
 	wc.ChunkRetryDeadline = 0
 
 	n, err := io.Copy(wc, reader)
 	if err != nil {
-		return "", 0, err
+		return "", 0, wrapGCPError(err)
 	}
 
 	if err = wc.Close(); err != nil {
-		return "", 0, err
+		return "", 0, wrapGCPError(err)
 	}
 
-	return fmt.Sprintf("https://%s.storage.googleapis.com/%s", s.conf.Bucket, storagePath), n, nil
+	return s.location(storagePath), n, nil
+}
+
+func (s *gcpStorage) location(storagePath string) string {
+	return (&url.URL{
+		Scheme: "https",
+		Host:   s.conf.Bucket + ".storage.googleapis.com",
+		Path:   storagePath,
+	}).String()
 }
 
 func (s *gcpStorage) ListObjects(prefix string) ([]string, error) {
@@ -132,7 +162,7 @@ func (s *gcpStorage) ListObjects(prefix string) ([]string, error) {
 			if errors.Is(err, iterator.Done) {
 				return objects, nil
 			}
-			return nil, err
+			return nil, wrapGCPError(err)
 		}
 		objects = append(objects, attr.Name)
 	}
@@ -143,13 +173,13 @@ func (s *gcpStorage) DownloadData(storagePath string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer rc.Close()
 
-	b := make([]byte, rc.Attrs.Size)
-	_, err = rc.Read(b)
+	data, err := io.ReadAll(rc)
 	if err != nil {
-		return nil, err
+		return nil, wrapGCPError(err)
 	}
-	return b, nil
+	return data, nil
 }
 
 func (s *gcpStorage) DownloadFile(filepath, storagePath string) (int64, error) {
@@ -167,28 +197,14 @@ func (s *gcpStorage) DownloadFile(filepath, storagePath string) (int64, error) {
 	_, err = io.Copy(file, rc)
 	_ = rc.Close()
 	if err != nil {
-		return 0, err
+		return 0, wrapGCPError(err)
 	}
 
 	return rc.Attrs.Size, nil
 }
 
 func (s *gcpStorage) download(storagePath string) (*storage.Reader, error) {
-	ctx := context.Background()
-	var client *storage.Client
-
-	var err error
-	if s.conf.CredentialsJSON != "" {
-		client, err = storage.NewClient(ctx, option.WithCredentialsJSON([]byte(s.conf.CredentialsJSON)))
-	} else {
-		client, err = storage.NewClient(ctx)
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer client.Close()
-
-	return client.Bucket(s.conf.Bucket).Object(storagePath).Retryer(
+	r, err := s.client.Bucket(s.conf.Bucket).Object(storagePath).Retryer(
 		storage.WithBackoff(
 			gax.Backoff{
 				Initial:    time.Millisecond * 100,
@@ -196,25 +212,33 @@ func (s *gcpStorage) download(storagePath string) (*storage.Reader, error) {
 				Multiplier: 2,
 			}),
 		storage.WithPolicy(storage.RetryAlways),
-	).NewReader(ctx)
+	).NewReader(context.Background())
+	if err != nil {
+		return nil, wrapGCPError(err)
+	}
+	return r, nil
 }
 
 func (s *gcpStorage) GeneratePresignedUrl(storagePath string, expiration time.Duration) (string, error) {
-	return s.client.Bucket(s.conf.Bucket).SignedURL(storagePath, &storage.SignedURLOptions{
+	u, err := s.client.Bucket(s.conf.Bucket).SignedURL(storagePath, &storage.SignedURLOptions{
 		Method:  "GET",
 		Expires: time.Now().Add(expiration),
 	})
+	if err != nil {
+		return "", wrapGCPError(err)
+	}
+	return u, nil
 }
 
 func (s *gcpStorage) DeleteObject(storagePath string) error {
-	return s.client.Bucket(s.conf.Bucket).Object(storagePath).Delete(context.Background())
+	return wrapGCPError(s.client.Bucket(s.conf.Bucket).Object(storagePath).Delete(context.Background()))
 }
 
 func (s *gcpStorage) DeleteObjects(storagePaths []string) error {
 	bucket := s.client.Bucket(s.conf.Bucket)
 	for _, path := range storagePaths {
 		if err := bucket.Object(path).Delete(context.Background()); err != nil {
-			return err
+			return wrapGCPError(err)
 		}
 	}
 	return nil
