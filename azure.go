@@ -25,6 +25,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
@@ -55,13 +56,30 @@ type azureBLOBStorage struct {
 }
 
 func NewAzure(conf *AzureConfig) (Storage, error) {
-	cred, err := azblob.NewSharedKeyCredential(conf.AccountName, conf.AccountKey)
-	if err != nil {
-		return nil, err
-	}
-
 	serviceUrl := fmt.Sprintf("https://%s.blob.core.windows.net/", conf.AccountName)
-	client, err := azblob.NewClientWithSharedKeyCredential(serviceUrl, cred, nil)
+
+	var client *azblob.Client
+	var err error
+	if conf.AccountKey == "" {
+		// No shared key configured: fall back to Azure AD authentication
+		// (managed identity, workload identity, CLI/env credentials, in
+		// that order) via DefaultAzureCredential, so a VM or pod granted
+		// an RBAC role on the storage account (e.g. "Storage Blob Data
+		// Contributor") can authenticate without ever handling the
+		// account's long-lived, full-account-scope shared key.
+		cred, credErr := azidentity.NewDefaultAzureCredential(nil)
+		if credErr != nil {
+			return nil, credErr
+		}
+		client, err = azblob.NewClient(serviceUrl, cred, nil)
+	} else {
+		var cred *azblob.SharedKeyCredential
+		cred, err = azblob.NewSharedKeyCredential(conf.AccountName, conf.AccountKey)
+		if err != nil {
+			return nil, err
+		}
+		client, err = azblob.NewClientWithSharedKeyCredential(serviceUrl, cred, nil)
+	}
 	if err != nil {
 		return nil, err
 	}
